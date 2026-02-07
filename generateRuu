@@ -1,0 +1,24 @@
+function [Ruu, tau_axis] = generateRuu(s, Ts)
+% Ruu(τ) ≈ sum_n u[n] u*[n+k] * Ts / Es  (chuẩn hoá để Ruu(0)=1)
+% u  : xung (cột), có thể phức
+% Ts=4.641400000000000e-12;
+% Trả về:
+%   Ruu      : vector (2N-1)x1
+%   tau_axis : trục τ tương ứng (2N-1)x1
+    md.type = 'RRC';
+    s = s(:);
+    N = numel(s);
+    md.Tp   = 0.5e-9;md.beta = 0.6;
+    tau = (0 : 4.6414e-12 : (28747-1)*4.6414e-12)';
+    tau_0 = 1e-8;
+    Ts = 4.641400000000000e-12;
+    % Tự tương quan rời rạc (MATLAB dùng liên hợp ở xcorr(u,u))
+    Ruu_raw = xcorr(s, s);             % 2N-1
+
+    % Chuẩn hoá theo năng lượng để Ruu(0)=1
+    Es = sum(abs(s).^2) * Ts;
+    Ruu = Ruu_raw * Ts / Es;
+
+    % Trục τ
+    tau_axis = (-N+1:N-1).' * Ts;
+end
