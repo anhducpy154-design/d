@@ -1,0 +1,262 @@
+function [tau_detect, gain_detect, h_mean, h_rvm, Ruu_short] = ...
+         RVM_Multipath_IV_A2(cir_storage, Ruu_full, win, delta_dB)
+%[tau_detect, gain_detect, h_mean, h_rvm, Ruu_short] = RVM_Multipath_IV_A2(Z, Ruu, 80, 6);
+%Z = IR_map;
+if nargin < 3 || isempty(win)
+    win = 80;
+end
+if nargin < 4 || isempty(delta_dB)
+    delta_dB = 6;    % ngưỡng cao hơn noise floor (dB)
+end
+
+Luse = 1000;
+S = size(cir_storage,3);          % 28747
+Luse = min(Luse, S);              % safety
+
+z = squeeze(cir_storage(1,1,1:Luse));   % 5000x1
+z = z(:);
+N = length(z);
+
+% giữ tên biến cũ cho tương thích code phía sau
+cir_use = z;      % NO averaging
+P = 1;
+h_mean = z;
+
+
+figure('Name','CIR z','Color','w');
+
+subplot(2,1,1);
+plot(0:N-1, abs(z), 'LineWidth', 1.5);
+grid on;
+xlabel('Sample index');
+ylabel('|z[n]|');
+title('CIR (linear amplitude)');
+
+subplot(2,1,2);
+plot(0:N-1, 20*log10(abs(z)+eps), 'LineWidth', 1.5);
+grid on;
+xlabel('Sample index');
+ylabel('Magnitude (dB)');
+title('Average CIR (dB)');
+%% 2. Ước lượng noise (KHÔNG whitelist data)
+tail_idx    = round(0.8*N):N;
+noiseSample = abs(z(tail_idx)).^2;
+sigma2_n = median(noiseSample) + eps;
+beta        = 1 / sigma2_n;
+
+%% 3. Cắt Ruu quanh peak
+Ruu_full = Ruu_full(:);
+[~,pk]   = max(abs(Ruu_full));
+idxR     = max(1, pk-win) : min(length(Ruu_full), pk+win);
+Ruu_short = Ruu_full(idxR);
+Ruu_short = Ruu_short / max(abs(Ruu_short));
+
+%% 4. Dựng K Toeplitz từ Ruu_short
+L = length(Ruu_short);
+K = zeros(N,N);
+for tau = 0:N-1
+    col = zeros(N,1);
+    row_start = tau+1;
+    len = min(L, N-tau);
+    col(row_start:row_start+len-1) = Ruu_short(1:len);
+    K(:,tau+1) = col;
+end
+
+%% 5. RVM vector (Tipping)
+alpha    = 1e3 * ones(N,1);
+keepMask = true(N,1);
+
+maxIter   = 500;
+tol_alpha = 1e-4;
+alpha_max = 1e9;
+
+for it = 1:maxIter
+    idx = find(keepMask);
+    Phi = K(:,idx);
+    a   = alpha(idx);
+
+    A     = diag(a) + beta * (Phi' * Phi);
+    A     = A + 1e-12*eye(size(A));
+    Sigma = inv(A);
+    mu    = beta * (Sigma * (Phi' * z));
+
+    gamma = 1 - a .* diag(Sigma);
+    alpha_new = gamma ./ (abs(mu).^2 + eps);
+
+    resid = z - Phi * mu;
+    beta_new = (N - sum(gamma)) / (resid' * resid + eps);
+    beta       = beta_new;
+
+    kill = alpha > alpha_max;
+    keepMask(kill) = false;
+    alpha_old = alpha(idx);
+
+    alpha(idx) = alpha_new;
+
+    if max(abs(alpha(idx) - alpha_old) ./ (alpha_old + eps)) < tol_alpha
+    break;
+    end
+end
+
+idx = find(keepMask);
+Phi = K(:,idx);
+a   = alpha(idx);
+A     = diag(a) + beta * (Phi' * Phi);
+A     = A + 1e-12*eye(size(A));
+Sigma = inv(A);
+mu    = beta * (Sigma * (Phi' * z));
+
+w_hat      = zeros(N,1);
+w_hat(idx) = mu;
+h_rvm      = K * w_hat;
+
+%% 6. PDP, noise floor và detect multipath như paper
+pdp_meas    = abs(z).^2;
+pdp_rvm     = abs(h_rvm).^2;
+pdp_meas_dB = 10*log10(pdp_meas + eps);
+pdp_rvm_dB  = 10*log10(pdp_rvm  + eps);
+% --- Noise floor và ngưỡng ---
+noise_floor_dB = 10*log10(sigma2_n + eps);
+thresh_dB      = noise_floor_dB + delta_dB;
+[pks, locs] = findpeaks(pdp_rvm_dB, ...
+    'MinPeakHeight', thresh_dB, ...
+    'MinPeakProminence', 1);
+
+if isempty(locs)
+    [pks, locs] = findpeaks(pdp_rvm_dB, ...
+        'MinPeakHeight', thresh_dB - 3, ...
+        'MinPeakProminence', 1);
+end
+
+tau_detect  = locs - 1;
+gain_detect = h_rvm(locs);
+L_det = numel(tau_detect);
+
+if L_det == 0
+    disp('No multipath components detected (locs is empty).');
+else
+    T = table( (1:L_det).', tau_detect(:), abs(gain_detect(:)), angle(gain_detect(:)), ...
+               real(gain_detect(:)), imag(gain_detect(:)), ...
+        'VariableNames', {'Idx','DelaySample','Mag','PhaseRad','Re','Im'} );
+    disp(T);
+end
+
+
+%% 7. Plot kiểu hình (8) trong bài
+n = 0:N-1;
+figure('Name','RVM PDP (Shutin style)','Color','w');
+
+% Linear PDP
+subplot(2,1,1); hold on; grid on;
+plot(n, pdp_meas, 'b.', 'MarkerSize', 8);
+plot(n, pdp_rvm,  'r-', 'LineWidth', 1.2);
+yline(10^(noise_floor_dB/10), 'g--', 'LineWidth',1);
+scatter(tau_detect, pdp_rvm(locs), 40, 'ko', 'filled');
+xlabel('Delay (sample index)');
+ylabel('Power');
+title('Measured & Reconstructed PDP (linear)');
+legend('Measured PDP','Reconstructed PDP','Estimated noise floor','Detected multipaths');
+
+% dB PDP
+subplot(2,1,2); hold on; grid on;
+plot(n, pdp_meas_dB, 'b.', 'MarkerSize', 8);
+plot(n, pdp_rvm_dB,  'r-', 'LineWidth', 1.2);
+yline(noise_floor_dB, 'g--', 'LineWidth',1);
+scatter(tau_detect, pdp_rvm_dB(locs), 40, 'ko', 'filled');
+xlabel('Delay (sample index)');
+ylabel('Magnitude (dB)');
+title('Measured & Reconstructed PDP (dB)');
+legend('Measured PDP (dB)','Reconstructed PDP (dB)', ...
+       'Estimated noise floor','Detected multipaths');
+
+
+
+%% 8. Plot các thành phần kênh đa đường đã detect
+figure('Name','Detected Multipath Components','Color','w');
+
+% Số đường đa đường
+L_det = numel(tau_detect);
+
+% (1) Biên độ theo độ trễ (magnitude)
+subplot(2,2,1);
+stem(tau_detect, abs(gain_detect), 'filled','LineWidth',1.4);
+grid on;
+xlabel('Delay (sample index)');
+ylabel('|g_l|');
+title('Multipath amplitude vs delay');
+
+% (2) Công suất theo độ trễ (|g|^2)
+subplot(2,2,2);
+stem(tau_detect, abs(gain_detect).^2, 'filled','LineWidth',1.4);
+grid on;
+xlabel('Delay (sample index)');
+ylabel('|g_l|^2');
+title('Multipath power vs delay');
+
+% (3) Phần thực/ảo của gain (biên độ phức)
+subplot(2,2,3); hold on; grid on;
+stem(tau_detect, real(gain_detect), 'b','LineWidth',1.2);
+stem(tau_detect, imag(gain_detect), 'r','LineWidth',1.2);
+xlabel('Delay (sample index)');
+ylabel('Real / Imag');
+title('Real & Imag parts of multipath gains');
+legend('Re\{g_l\}','Im\{g_l\}');
+
+% (4) Pha của gain
+subplot(2,2,4);
+stem(tau_detect, angle(gain_detect), 'filled','LineWidth',1.4);
+grid on;
+xlabel('Delay (sample index)');
+ylabel('Phase (rad)');
+title('Phase of multipath gains');
+%% 9. In tham số đa đường ra Command Window
+fprintf('\n=== Detected multipath parameters ===\n');
+fprintf('Idx\tDelay(sample)\t|g_l|\t\tPhase(rad)\tRe{g_l}\t\tIm{g_l}\n');
+
+for l = 1:L_det
+    mag  = abs(gain_detect(l));
+    ph   = angle(gain_detect(l));
+    gr   = real(gain_detect(l));
+    gi   = imag(gain_detect(l));
+    fprintf('%2d\t%4d\t\t% .4e\t% .4f\t% .4e\t% .4e\n', ...
+        l, tau_detect(l), mag, ph, gr, gi);
+end
+fprintf('=====================================\n\n');
+
+
+
+
+%% === Raw signal with DATA-DRIVEN MPC annotation ===
+% MPCs are defined as peaks detected by RVM + thresholding (locs)
+
+figure('Name','Raw signal with detected MPCs','Color','w');
+grid on; hold on;
+
+n = 0:N-1;
+z_dB = 20*log10(abs(z) + eps);
+
+% plot raw signal
+plot(n, z_dB, 'b', 'LineWidth', 1.2);
+
+% plot noise threshold (convert from power dB to magnitude dB)
+thresh_mag_dB = 0.5 * thresh_dB;
+yline(thresh_mag_dB, 'k--', 'LineWidth', 1.2);
+
+% annotate ALL detected MPCs (data-driven)
+if ~isempty(locs)
+    scatter(locs-1, z_dB(locs), 50, 'ro', 'filled');
+    for i = 1:numel(locs)
+        text(locs(i)-1, z_dB(locs(i)), ...
+            sprintf(' MPC%d', i), ...
+            'VerticalAlignment','bottom', ...
+            'FontSize',9);
+    end
+end
+
+xlabel('Sample index');
+ylabel('Magnitude (dB)');
+title('Raw signal with data-driven multipath component detection');
+
+legend('Raw signal','Detection threshold','Detected MPCs');
+
+end
